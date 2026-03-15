@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 # %%
 FITBIT_LOG_FILE_PATH = os.environ.get("FITBIT_LOG_FILE_PATH") or "your/expected/log/file/location/path"
 TOKEN_FILE_PATH = os.environ.get("TOKEN_FILE_PATH") or "your/expected/token/file/location/path"
-OVERWRITE_LOG_FILE = True
+OVERWRITE_LOG_FILE = os.environ.get("OVERWRITE_LOG_FILE", "True").lower() not in ('false', 'f', 'no', '0')
 FITBIT_LANGUAGE = 'en_US'
 INFLUXDB_VERSION = os.environ.get("INFLUXDB_VERSION") or "1" # Version of influxdb in use, supported values are 1 or 2
 assert INFLUXDB_VERSION in ['1','2','3'], "Only InfluxDB version 1 or 2 or 3 is allowed - please put either 1 or 2 or 3"
@@ -437,13 +437,17 @@ def get_daily_data_limit_100d(start_date_str, end_date_str):
         for record in sleep_data:
             log_time = datetime.fromisoformat(record["startTime"])
             utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
-            try:
-                minutesLight= record['levels']['summary']['light']['minutes']
-                minutesREM = record['levels']['summary']['rem']['minutes']
-                minutesDeep = record['levels']['summary']['deep']['minutes']
-            except:
-                minutesLight= record['levels']['summary']['asleep']['minutes']
-                minutesREM = record['levels']['summary']['restless']['minutes']
+            sleep_type = record.get("type", "classic")
+            log_type = record.get("logType", "unknown")
+            is_main_sleep = record.get("isMainSleep", False)
+
+            if sleep_type == "stages":
+                minutesLight = record['levels']['summary'].get('light', {}).get('minutes', 0)
+                minutesREM = record['levels']['summary'].get('rem', {}).get('minutes', 0)
+                minutesDeep = record['levels']['summary'].get('deep', {}).get('minutes', 0)
+            else:
+                minutesLight = record['levels']['summary'].get('asleep', {}).get('minutes', 0)
+                minutesREM = record['levels']['summary'].get('restless', {}).get('minutes', 0)
                 minutesDeep = 0
 
             collected_records.append({
@@ -451,37 +455,47 @@ def get_daily_data_limit_100d(start_date_str, end_date_str):
                     "time": utc_time,
                     "tags": {
                         "Device": DEVICENAME,
-                        "isMainSleep": record["isMainSleep"],
+                        "isMainSleep": is_main_sleep,
+                        "sleepType": sleep_type,
+                        "logType": log_type,
                     },
                     "fields": {
-                        'efficiency': record["efficiency"],
-                        'minutesAfterWakeup': record['minutesAfterWakeup'],
-                        'minutesAsleep': record['minutesAsleep'],
-                        'minutesToFallAsleep': record['minutesToFallAsleep'],
-                        'minutesInBed': record['timeInBed'],
-                        'minutesAwake': record['minutesAwake'],
+                        'efficiency': record.get("efficiency", 0),
+                        'minutesAfterWakeup': record.get('minutesAfterWakeup', 0),
+                        'minutesAsleep': record.get('minutesAsleep', 0),
+                        'minutesToFallAsleep': record.get('minutesToFallAsleep', 0),
+                        'minutesInBed': record.get('timeInBed', 0),
+                        'minutesAwake': record.get('minutesAwake', 0),
                         'minutesLight': minutesLight,
                         'minutesREM': minutesREM,
                         'minutesDeep': minutesDeep
                     }
                 })
-            
+
             sleep_level_mapping = {'wake': 3, 'rem': 2, 'light': 1, 'deep': 0, 'asleep': 1, 'restless': 2, 'awake': 3, 'unknown': 4}
-            for sleep_stage in record['levels']['data']:
-                log_time = datetime.fromisoformat(sleep_stage["dateTime"])
-                utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+
+            # Merge data and shortData (shortData contains wake periods ≤3 min for stages-type logs)
+            all_sleep_stages = list(record['levels'].get('data', []))
+            if sleep_type == "stages":
+                all_sleep_stages += record['levels'].get('shortData', [])
+
+            for sleep_stage in all_sleep_stages:
+                stage_time = datetime.fromisoformat(sleep_stage["dateTime"])
+                stage_utc = LOCAL_TIMEZONE.localize(stage_time).astimezone(pytz.utc).isoformat()
                 collected_records.append({
                         "measurement":  "Sleep Levels",
-                        "time": utc_time,
+                        "time": stage_utc,
                         "tags": {
                             "Device": DEVICENAME,
-                            "isMainSleep": record["isMainSleep"],
+                            "isMainSleep": is_main_sleep,
+                            "sleepType": sleep_type,
                         },
                         "fields": {
-                            'level': sleep_level_mapping[sleep_stage["level"]],
+                            'level': sleep_level_mapping.get(sleep_stage["level"], 4),
                             'duration_seconds': sleep_stage["seconds"]
                         }
                     })
+
             wake_time = datetime.fromisoformat(record["endTime"])
             utc_wake_time = LOCAL_TIMEZONE.localize(wake_time).astimezone(pytz.utc).isoformat()
             collected_records.append({
@@ -489,18 +503,19 @@ def get_daily_data_limit_100d(start_date_str, end_date_str):
                         "time": utc_wake_time,
                         "tags": {
                             "Device": DEVICENAME,
-                            "isMainSleep": record["isMainSleep"],
+                            "isMainSleep": is_main_sleep,
+                            "sleepType": sleep_type,
                         },
                         "fields": {
                             'level': sleep_level_mapping['wake'],
-                            'duration_seconds': None
+                            'duration_seconds': 0
                         }
                     })
         logging.info("Recorded Sleep data for date " + start_date_str + " to " + end_date_str)
     else:
         logging.error("Recording failed : Sleep data for date " + start_date_str + " to " + end_date_str)
 
-# Max date range 1 year, records HR zones, Activity minutes and Resting HR - 4 + 3 + 1 + 1 = 9 queries
+# Max date range 1 year, records HR zones, Activity minutes, Resting HR, Floors, Elevation, Cardio Fitness - 4 + 3 + 1 + 1 + 1 + 1 + 1 = 12 queries
 def get_daily_data_limit_365d(start_date_str, end_date_str):
     activity_minutes_list = ["minutesSedentary", "minutesLightlyActive", "minutesFairlyActive", "minutesVeryActive"]
     for activity_type in activity_minutes_list:
@@ -598,6 +613,59 @@ def get_daily_data_limit_365d(start_date_str, end_date_str):
         logging.info("Recorded HR zone minutes for date " + start_date_str + " to " + end_date_str)
     else:
         logging.error("Recording failed : HR zone minutes for date " + start_date_str + " to " + end_date_str)
+
+    floors_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/tracker/floors/date/' + start_date_str + '/' + end_date_str + '.json').get("activities-tracker-floors")
+    if floors_data_list is not None:
+        for data in floors_data_list:
+            log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
+            utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+            collected_records.append({
+                "measurement": "Floors",
+                "time": utc_time,
+                "tags": {"Device": DEVICENAME},
+                "fields": {"value": int(data["value"])}
+            })
+        logging.info("Recorded Floors for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.warning("Records not found : Floors for date " + start_date_str + " to " + end_date_str)
+
+    elevation_data_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/activities/tracker/elevation/date/' + start_date_str + '/' + end_date_str + '.json').get("activities-tracker-elevation")
+    if elevation_data_list is not None:
+        for data in elevation_data_list:
+            log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
+            utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+            collected_records.append({
+                "measurement": "Elevation",
+                "time": utc_time,
+                "tags": {"Device": DEVICENAME},
+                "fields": {"value": float(data["value"])}
+            })
+        logging.info("Recorded Elevation for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.warning("Records not found : Elevation for date " + start_date_str + " to " + end_date_str)
+
+    cardio_score_list = request_data_from_fitbit('https://api.fitbit.com/1/user/-/cardioscore/date/' + start_date_str + '/' + end_date_str + '.json').get("cardioScore")
+    if cardio_score_list is not None:
+        for data in cardio_score_list:
+            log_time = datetime.fromisoformat(data["dateTime"] + "T" + "00:00:00")
+            utc_time = LOCAL_TIMEZONE.localize(log_time).astimezone(pytz.utc).isoformat()
+            vo2_raw = data["value"].get("vo2Max", "")
+            if vo2_raw:
+                vo2_str = str(vo2_raw)
+                if "-" in vo2_str:  # Range like "40-44" when no GPS run data
+                    parts = vo2_str.split("-")
+                    vo2_value = (float(parts[0]) + float(parts[1])) / 2
+                else:
+                    vo2_value = float(vo2_str)
+                collected_records.append({
+                    "measurement": "CardioFitness",
+                    "time": utc_time,
+                    "tags": {"Device": DEVICENAME},
+                    "fields": {"vo2Max": vo2_value}
+                })
+        logging.info("Recorded Cardio Fitness Score for date " + start_date_str + " to " + end_date_str)
+    else:
+        logging.warning("Records not found : Cardio Fitness Score for date " + start_date_str + " to " + end_date_str)
 
 # records SPO2 single days for the whole given period - 1 query
 def get_daily_data_limit_none(start_date_str, end_date_str):
@@ -743,7 +811,7 @@ def fetch_latest_activities(end_date_str):
 if AUTO_DATE_RANGE:
     date_list = [(start_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((end_date - start_date).days + 1)]
     if len(date_list) > 3:
-        logging.warn("Auto schedule update is not meant for more than 3 days at a time, please consider lowering the auto_update_date_range variable to aviod rate limit hit!")
+        logging.warning("Auto schedule update is not meant for more than 3 days at a time, please consider lowering the auto_update_date_range variable to avoid rate limit hit!")
     for date_str in date_list:
         get_intraday_data_limit_1d(date_str, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')]) # 2 queries x number of dates ( default 2)
     get_daily_data_limit_30d(start_date_str, end_date_str) # 3 queries
