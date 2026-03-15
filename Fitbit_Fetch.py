@@ -483,12 +483,8 @@ def get_daily_data_limit_100d(start_date_str, end_date_str):
 
             sleep_level_mapping = {'wake': 3, 'rem': 2, 'light': 1, 'deep': 0, 'asleep': 1, 'restless': 2, 'awake': 3, 'unknown': 4}
 
-            # Merge data and shortData (shortData contains wake periods ≤3 min for stages-type logs)
-            all_sleep_stages = list(record['levels'].get('data', []))
-            if sleep_type == "stages":
-                all_sleep_stages += record['levels'].get('shortData', [])
-
-            for sleep_stage in all_sleep_stages:
+            # Process main sleep stage data
+            for sleep_stage in record['levels'].get('data', []):
                 stage_time = datetime.fromisoformat(sleep_stage["dateTime"])
                 stage_utc = LOCAL_TIMEZONE.localize(stage_time).astimezone(pytz.utc).isoformat()
                 collected_records.append({
@@ -498,12 +494,51 @@ def get_daily_data_limit_100d(start_date_str, end_date_str):
                             "Device": DEVICENAME,
                             "isMainSleep": is_main_sleep,
                             "sleepType": sleep_type,
+                            "isRestless": False,
                         },
                         "fields": {
                             'level': sleep_level_mapping.get(sleep_stage["level"], 4),
                             'duration_seconds': sleep_stage["seconds"]
                         }
                     })
+
+            # Process shortData (wake periods ≤3 min) — these represent restlessness
+            restless_count = 0
+            restless_seconds = 0
+            for sleep_stage in record['levels'].get('shortData', []):
+                stage_time = datetime.fromisoformat(sleep_stage["dateTime"])
+                stage_utc = LOCAL_TIMEZONE.localize(stage_time).astimezone(pytz.utc).isoformat()
+                restless_count += 1
+                restless_seconds += sleep_stage["seconds"]
+                collected_records.append({
+                        "measurement":  "Sleep Levels",
+                        "time": stage_utc,
+                        "tags": {
+                            "Device": DEVICENAME,
+                            "isMainSleep": is_main_sleep,
+                            "sleepType": sleep_type,
+                            "isRestless": True,
+                        },
+                        "fields": {
+                            'level': sleep_level_mapping.get(sleep_stage["level"], 4),
+                            'duration_seconds': sleep_stage["seconds"]
+                        }
+                    })
+
+            # Store restlessness summary as its own measurement for easy charting
+            if sleep_type == "stages" and restless_count > 0:
+                collected_records.append({
+                    "measurement": "Sleep Restlessness",
+                    "time": utc_time,
+                    "tags": {
+                        "Device": DEVICENAME,
+                        "isMainSleep": is_main_sleep,
+                    },
+                    "fields": {
+                        "restless_count": restless_count,
+                        "restless_seconds": restless_seconds,
+                    }
+                })
 
             wake_time = datetime.fromisoformat(record["endTime"])
             utc_wake_time = LOCAL_TIMEZONE.localize(wake_time).astimezone(pytz.utc).isoformat()
