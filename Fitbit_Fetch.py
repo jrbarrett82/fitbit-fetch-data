@@ -279,18 +279,27 @@ def update_working_dates():
 
 # Get last synced battery level of the device
 def get_battery_level():
-    device = request_data_from_fitbit("https://api.fitbit.com/1/user/-/devices.json")[0]
-    if device != None:
-        collected_records.append({
-            "measurement": "DeviceBatteryLevel",
-            "time": LOCAL_TIMEZONE.localize(datetime.fromisoformat(device['lastSyncTime'])).astimezone(pytz.utc).isoformat(),
-            "fields": {
-                "value": float(device['batteryLevel'])
-            }
-        })
-        logging.info("Recorded battery level for " + DEVICENAME)
+    battery_string_map = {"Full": 100, "High": 80, "Medium": 50, "Low": 20, "Empty": 0}
+    devices = request_data_from_fitbit("https://api.fitbit.com/1/user/-/devices.json")
+    if not devices:
+        logging.error("Recording battery level failed: no devices returned")
+        return
+    device = next((d for d in devices if d.get("deviceVersion", "").upper() == DEVICENAME.upper()), devices[0])
+    if "batteryLevel" in device and device["batteryLevel"] is not None:
+        battery_value = float(device["batteryLevel"])
+    elif "battery" in device and device["battery"] in battery_string_map:
+        battery_value = float(battery_string_map[device["battery"]])
     else:
-        logging.error("Recording battery level failed : " + DEVICENAME)
+        logging.error("Recording battery level failed: unrecognised battery data for " + DEVICENAME)
+        return
+    collected_records.append({
+        "measurement": "DeviceBatteryLevel",
+        "time": LOCAL_TIMEZONE.localize(datetime.fromisoformat(device['lastSyncTime'])).astimezone(pytz.utc).isoformat(),
+        "fields": {
+            "value": battery_value
+        }
+    })
+    logging.info("Recorded battery level for " + DEVICENAME)
 
 # For intraday detailed data, max possible range in one day. 
 def get_intraday_data_limit_1d(date_str, measurement_list):
